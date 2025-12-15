@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="WALLEFFP.vcxproj" Id="7850fbdd-addb-4230-ba66-812849ce2126" />
+</Solution>
