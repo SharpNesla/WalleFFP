@@ -2,15 +2,150 @@
 
 #include <cmath>
 #include <cstring>
+#include <cstdio>
+
+#include "window_hook.h"
+
+static D3DMATRIX TransposeMatrix(const D3DMATRIX& a) {
+    D3DMATRIX t{};
+    for (int r = 0; r < 4; r++) {
+        for (int c = 0; c < 4; c++) {
+            t.m[r][c] = a.m[c][r];
+        }
+    }
+    return t;
+}
+
+struct ProjInfo {
+    float zn = 0.0f;
+    float zf = 0.0f;
+    bool valid = false;
+};
+
+static bool IsFiniteMatrix(const D3DMATRIX& m) {
+    const float* f = reinterpret_cast<const float*>(&m);
+    for (int i = 0; i < 16; i++) {
+        if (!std::isfinite(f[i])) return false;
+    }
+    return true;
+}
+
+static float AbsSumMatrix(const D3DMATRIX& m) {
+    const float* f = reinterpret_cast<const float*>(&m);
+    float s = 0.f;
+    for (int i = 0; i < 16; i++) s += std::fabs(f[i]);
+    return s;
+}
+
+// Try to extract near/far from common D3D-style perspective projections.
+// Handles both LH (m[2][3] ~= +1) and RH (m[2][3] ~= -1) in row-major layout.
+static ProjInfo ExtractNearFarRowMajor(const D3DMATRIX& p) {
+    ProjInfo out{};
+
+    if (!IsFiniteMatrix(p)) return out;
+
+    const float m33 = p.m[2][2];
+    const float m34 = p.m[2][3];
+    const float m43 = p.m[3][2];
+    const float m44 = p.m[3][3];
+
+    if (std::fabs(m44) > 1e-2f) return out;
+    if (std::fabs(std::fabs(m34) - 1.0f) > 1e-2f) return out;
+    if (std::fabs(m33) < 1e-6f) return out;
+
+    // LH: m34=+1, m33=zf/(zf-zn), m43=-zn*zf/(zf-zn)
+    if (m34 > 0.0f) {
+        const float zn = -m43 / m33;
+        const float denom = (m33 - 1.0f);
+        if (zn > 0.0f && std::fabs(denom) > 1e-6f) {
+            const float zf = (m33 * zn) / denom;
+            if (zf > zn) {
+                out.zn = zn;
+                out.zf = zf;
+                out.valid = true;
+                return out;
+            }
+        }
+    }
+
+    // RH: m34=-1, m33=zf/(zn-zf), m43=zn*zf/(zn-zf)
+    if (m34 < 0.0f) {
+        const float zn = -m43 / m33;
+        const float denom = (m33 + 1.0f);
+        if (zn > 0.0f && std::fabs(denom) > 1e-6f) {
+            const float zf = (m33 * zn) / denom;
+            if (zf > zn) {
+                out.zn = zn;
+                out.zf = zf;
+                out.valid = true;
+                return out;
+            }
+        }
+    }
+
+    return out;
+}
+
+static float ScoreProjectionCandidate(const D3DMATRIX& p, ProjInfo* infoOut) {
+    if (infoOut) *infoOut = {};
+    if (!IsFiniteMatrix(p)) return -1.0f;
+
+    const float absSum = AbsSumMatrix(p);
+    if (absSum < 1e-3f) return -1.0f;
+
+    ProjInfo info = ExtractNearFarRowMajor(p);
+    if (infoOut) *infoOut = info;
+    if (!info.valid) return 0.0f;
+
+    // Prefer farther far-plane and sane ranges.
+    if (!(info.zn > 0.0f && info.zf > info.zn)) return 0.0f;
+    if (info.zn > 10.0f) return 0.25f;      // unlikely: near too big
+    if (info.zf < 5.0f) return 0.1f;         // matches the "wall" symptom
+    if (info.zf > 1e7f) return 0.25f;        // unlikely huge
+
+    // Scale score gently by far-plane distance.
+    const float zf = (info.zf > 1.0f) ? info.zf : 1.0f;
+    return 1.0f + std::log10(zf);
+}
+
+static bool IsWorldishDrawGate(DWORD zEnable, DWORD zWriteEnable, DWORD alphaBlendEnable, DWORD colorWriteEnable) {
+    const bool zOn = (zEnable != D3DZB_FALSE);
+    const bool zWrite = (zWriteEnable != FALSE);
+    const bool noBlend = (alphaBlendEnable == FALSE);
+    (void)colorWriteEnable; // allow depth-only prepass (COLORWRITE=0)
+    return zOn && zWrite && noBlend;
+}
 
 D3D9DeviceProxy::D3D9DeviceProxy(IDirect3DDevice9* real) : m_real(real) {
     if (m_real) {
         m_real->AddRef();
+        m_real->QueryInterface(__uuidof(IDirect3DDevice9Ex), reinterpret_cast<void**>(&m_realEx));
     }
+
+    {
+        char buf[64] = {};
+        DWORD n = GetEnvironmentVariableA("WALLEFFP_FORCE_PRIMARY_RT", buf, static_cast<DWORD>(sizeof(buf)));
+        if (n > 0) m_forcePrimaryRT = (buf[0] != '0');
+    }
+    {
+        char buf[64] = {};
+        DWORD n = GetEnvironmentVariableA("WALLEFFP_FORCE_PRIMARY_RT_AGGRESSIVE", buf, static_cast<DWORD>(sizeof(buf)));
+        if (n > 0) m_forcePrimaryRTAggressive = (buf[0] != '0');
+    }
+
     ProxyAddRemixRef();
+    UpdateBackbufferDesc();
 }
 
 D3D9DeviceProxy::~D3D9DeviceProxy() {
+    if (m_cachedBackbuffer) {
+        m_cachedBackbuffer->Release();
+        m_cachedBackbuffer = nullptr;
+    }
+    if (m_realEx) {
+        m_realEx->Release();
+        m_realEx = nullptr;
+    }
     if (m_real) {
         m_real->Release();
         m_real = nullptr;
@@ -18,12 +153,208 @@ D3D9DeviceProxy::~D3D9DeviceProxy() {
     ProxyReleaseRemixRef();
 }
 
+bool D3D9DeviceProxy::Overlaps(UINT start, UINT count, UINT a, UINT b) {
+    const UINT end = start + count; // exclusive
+    return !(end <= a || start >= b);
+}
+
+bool D3D9DeviceProxy::PublishCameraFromVsConstsIfValid() {
+    if (!m_real || !m_haveVsConsts) return false;
+
+    auto load = [&](UINT base) {
+        D3DMATRIX m{};
+        m._11 = m_vsConsts[base + 0][0];
+        m._12 = m_vsConsts[base + 0][1];
+        m._13 = m_vsConsts[base + 0][2];
+        m._14 = m_vsConsts[base + 0][3];
+        m._21 = m_vsConsts[base + 1][0];
+        m._22 = m_vsConsts[base + 1][1];
+        m._23 = m_vsConsts[base + 1][2];
+        m._24 = m_vsConsts[base + 1][3];
+        m._31 = m_vsConsts[base + 2][0];
+        m._32 = m_vsConsts[base + 2][1];
+        m._33 = m_vsConsts[base + 2][2];
+        m._34 = m_vsConsts[base + 2][3];
+        m._41 = m_vsConsts[base + 3][0];
+        m._42 = m_vsConsts[base + 3][1];
+        m._43 = m_vsConsts[base + 3][2];
+        m._44 = m_vsConsts[base + 3][3];
+        return m;
+    };
+
+    const D3DMATRIX viewRaw = load(5);
+    const D3DMATRIX projRaw = load(10);
+
+    ProjInfo infoRaw{};
+    ProjInfo infoT{};
+    const float scoreRaw = ScoreProjectionCandidate(projRaw, &infoRaw);
+    const D3DMATRIX projT = TransposeMatrix(projRaw);
+    const float scoreT = ScoreProjectionCandidate(projT, &infoT);
+
+    const bool needsTranspose = (scoreT > scoreRaw);
+    const D3DMATRIX view = needsTranspose ? TransposeMatrix(viewRaw) : viewRaw;
+    const D3DMATRIX proj = needsTranspose ? projT : projRaw;
+
+    if (!IsFiniteMatrix(view) || !IsFiniteMatrix(proj)) return false;
+    if (AbsSumMatrix(view) < 1e-3f || AbsSumMatrix(proj) < 1e-3f) return false;
+
+    // Reject projections that still imply the "wall" far-plane.
+    ProjInfo chosenInfo = needsTranspose ? infoT : infoRaw;
+    if (!chosenInfo.valid) return false;
+    if (chosenInfo.zf < 5.0f) return false;
+
+    m_real->SetTransform(D3DTS_VIEW, &view);
+    m_real->SetTransform(D3DTS_PROJECTION, &proj);
+
+    m_lastView = view;
+    m_lastProj = proj;
+    m_haveLastCamera = true;
+
+    if (needsTranspose) {
+        OutputDebugStringA("[WALLEFFP] Projection candidate: transposed\n");
+    }
+
+    if (m_dbgCameraPublishes <= 5 || (m_dbgCameraPublishes % 300 == 0)) {
+        char buf[192];
+        std::snprintf(
+            buf,
+            sizeof(buf),
+            "[WALLEFFP] Camera proj zn=%.4f zf=%.4f (scoreRaw=%.2f scoreT=%.2f)\n",
+            chosenInfo.zn,
+            chosenInfo.zf,
+            scoreRaw,
+            scoreT);
+        OutputDebugStringA(buf);
+    }
+    return true;
+}
+
+void D3D9DeviceProxy::TryPublishCameraOncePerScene() {
+    static const bool publishCamera = ProxyEnvFlag("WALLEFFP_PUBLISH_CAMERA", true);
+    if (!publishCamera) return;
+    if (!m_inScene) return;
+    if (m_publishedThisScene) return;
+    if (!m_haveVsConsts) return;
+
+    if (!m_rt0IsPrimary) return;
+    if (!IsWorldishDrawGate(m_rsZEnable, m_rsZWriteEnable, m_rsAlphaBlendEnable, m_rsColorWriteEnable)) return;
+
+    bool published = false;
+    if (m_dirtyView && m_dirtyProj) published = PublishCameraFromVsConstsIfValid();
+    if (!published && m_haveLastCamera) {
+        m_real->SetTransform(D3DTS_VIEW, &m_lastView);
+        m_real->SetTransform(D3DTS_PROJECTION, &m_lastProj);
+        published = true;
+    }
+
+    if (published) {
+        m_publishedThisScene = true;
+        m_dirtyView = m_dirtyProj = m_dirtyWorld = false;
+
+        m_dbgCameraPublishes++;
+        if ((m_dbgCameraPublishes <= 10) || (m_dbgCameraPublishes % 300 == 0)) {
+            char buf[128];
+            std::snprintf(buf, sizeof(buf), "[WALLEFFP] Camera published (%u)\n", m_dbgCameraPublishes);
+            OutputDebugStringA(buf);
+        }
+    }
+}
+
+// Per-frame RT0 usage, dumped every kFrameStatsPeriod frames: which targets the
+// game draws into, how many draws each gets and on which the camera was published.
+void D3D9DeviceProxy::NoteFrameRt0(IDirect3DSurface9* rt) {
+    for (UINT i = 0; i < m_frameRtCount; i++) {
+        if (m_frameRts[i].surface == rt) {
+            m_frameRtCur = static_cast<int>(i);
+            return;
+        }
+    }
+    if (m_frameRtCount == kMaxFrameRts) {
+        m_frameRtCur = -1;
+        return;
+    }
+    m_frameRts[m_frameRtCount] = {rt, 0, 0};
+    m_frameRtCur = static_cast<int>(m_frameRtCount++);
+}
+
+void D3D9DeviceProxy::NoteFrameDraw() {
+    if (m_frameRtCur < 0) return;
+    m_frameRts[m_frameRtCur].draws++;
+    if (m_publishedThisScene) m_frameRts[m_frameRtCur].cameraDraws++;
+}
+
+void D3D9DeviceProxy::EndFrameStats() {
+    if ((m_frameNo++ % kFrameStatsPeriod) == 0) {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf), "[WALLEFFP] frame %u: %u RT0 targets, bb=%ux%u fmt=%u, cameraPublishes=%u\n",
+                      m_frameNo, m_frameRtCount, m_bbWidth, m_bbHeight, static_cast<unsigned>(m_bbFormat), m_dbgCameraPublishes);
+        OutputDebugStringA(buf);
+        for (UINT i = 0; i < m_frameRtCount; i++) {
+            const FrameRt& f = m_frameRts[i];
+            D3DSURFACE_DESC d{};
+            if (f.surface) f.surface->GetDesc(&d);
+            std::snprintf(buf, sizeof(buf), "[WALLEFFP]   rt%u %p %s %ux%u fmt=%u draws=%u cameraDraws=%u\n",
+                          i, static_cast<void*>(f.surface), f.surface == m_cachedBackbuffer ? "BACKBUFFER" : "offscreen",
+                          d.Width, d.Height, static_cast<unsigned>(d.Format), f.draws, f.cameraDraws);
+            OutputDebugStringA(buf);
+        }
+    }
+    m_frameRtCount = 0;
+    m_frameRtCur = -1;
+}
+
+void D3D9DeviceProxy::ReinstallActivateAppFilter() {
+    D3DDEVICE_CREATION_PARAMETERS cp{};
+    if (SUCCEEDED(m_real->GetCreationParameters(&cp))) InstallActivateAppFilter(cp.hFocusWindow);
+}
+
+// D3D9 refuses Reset/ResetEx (D3DERR_INVALIDCALL) while any swap chain buffer
+// is still referenced, so the cached backbuffer must be dropped first.
+void D3D9DeviceProxy::ReleaseCachedBackbuffer() {
+    if (m_cachedBackbuffer) {
+        m_cachedBackbuffer->Release();
+        m_cachedBackbuffer = nullptr;
+    }
+}
+
+void D3D9DeviceProxy::UpdateBackbufferDesc() {
+    if (!m_real) return;
+
+    IDirect3DSurface9* bb = nullptr;
+    if (FAILED(m_real->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) || !bb) return;
+
+    D3DSURFACE_DESC d{};
+    if (SUCCEEDED(bb->GetDesc(&d))) {
+        m_bbWidth = d.Width;
+        m_bbHeight = d.Height;
+        m_bbFormat = d.Format;
+    }
+
+    ReleaseCachedBackbuffer();
+    m_cachedBackbuffer = bb; // keep ref; dropped again before Reset/ResetEx
+}
+
+bool D3D9DeviceProxy::IsLikelyMainSceneRT(const D3DSURFACE_DESC& d) const {
+    if (!m_bbWidth || !m_bbHeight) return false;
+    if (d.Width != m_bbWidth || d.Height != m_bbHeight) return false;
+
+    switch (d.Format) {
+        case D3DFMT_A8R8G8B8:
+        case D3DFMT_X8R8G8B8:
+            return true;
+        default:
+            return false;
+    }
+}
+
 HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::QueryInterface(REFIID riid, void** ppvObj) {
     if (!ppvObj) return E_POINTER;
     *ppvObj = nullptr;
 
-    if (riid == __uuidof(IUnknown) || riid == __uuidof(IDirect3DDevice9)) {
-        *ppvObj = static_cast<IDirect3DDevice9*>(this);
+    // Only claim IDirect3DDevice9Ex when the real device is one: D3DX and games
+    // switch resource paths on this query, and our Ex methods fail without m_realEx.
+    if (riid == __uuidof(IUnknown) || riid == __uuidof(IDirect3DDevice9) || (riid == __uuidof(IDirect3DDevice9Ex) && m_realEx)) {
+        *ppvObj = static_cast<IDirect3DDevice9Ex*>(this);
         AddRef();
         return S_OK;
     }
@@ -51,8 +382,18 @@ BOOL STDMETHODCALLTYPE D3D9DeviceProxy::ShowCursor(BOOL bShow) { return m_real->
 HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::CreateAdditionalSwapChain(D3DPRESENT_PARAMETERS* pPresentationParameters, IDirect3DSwapChain9** pSwapChain) { return m_real->CreateAdditionalSwapChain(pPresentationParameters, pSwapChain); }
 HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::GetSwapChain(UINT iSwapChain, IDirect3DSwapChain9** pSwapChain) { return m_real->GetSwapChain(iSwapChain, pSwapChain); }
 UINT STDMETHODCALLTYPE D3D9DeviceProxy::GetNumberOfSwapChains() { return m_real->GetNumberOfSwapChains(); }
-HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::Reset(D3DPRESENT_PARAMETERS* pPresentationParameters) { return m_real->Reset(pPresentationParameters); }
-HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::Present(const RECT* pSourceRect, const RECT* pDestRect, HWND hDestWindowOverride, const RGNDATA* pDirtyRegion) { return m_real->Present(pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion); }
+HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::Reset(D3DPRESENT_PARAMETERS* pPresentationParameters) {
+    ReleaseCachedBackbuffer();
+    const HRESULT hr = m_real->Reset(pPresentationParameters);
+    if (SUCCEEDED(hr)) UpdateBackbufferDesc();
+    ReinstallActivateAppFilter();
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::Present(const RECT* pSourceRect, const RECT* pDestRect, HWND hDestWindowOverride, const RGNDATA* pDirtyRegion) {
+    EndFrameStats();
+    return m_real->Present(pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion);
+}
 HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::GetBackBuffer(UINT iSwapChain, UINT iBackBuffer, D3DBACKBUFFER_TYPE Type, IDirect3DSurface9** ppBackBuffer) { return m_real->GetBackBuffer(iSwapChain, iBackBuffer, Type, ppBackBuffer); }
 HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::GetRasterStatus(UINT iSwapChain, D3DRASTER_STATUS* pRasterStatus) { return m_real->GetRasterStatus(iSwapChain, pRasterStatus); }
 HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::SetDialogBoxMode(BOOL bEnableDialogs) { return m_real->SetDialogBoxMode(bEnableDialogs); }
@@ -72,12 +413,74 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::GetFrontBufferData(UINT iSwapChain, I
 HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::StretchRect(IDirect3DSurface9* pSourceSurface, const RECT* pSourceRect, IDirect3DSurface9* pDestSurface, const RECT* pDestRect, D3DTEXTUREFILTERTYPE Filter) { return m_real->StretchRect(pSourceSurface, pSourceRect, pDestSurface, pDestRect, Filter); }
 HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::ColorFill(IDirect3DSurface9* pSurface, const RECT* pRect, D3DCOLOR color) { return m_real->ColorFill(pSurface, pRect, color); }
 HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::CreateOffscreenPlainSurface(UINT Width, UINT Height, D3DFORMAT Format, D3DPOOL Pool, IDirect3DSurface9** ppSurface, HANDLE* pSharedHandle) { return m_real->CreateOffscreenPlainSurface(Width, Height, Format, Pool, ppSurface, pSharedHandle); }
-HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::SetRenderTarget(DWORD RenderTargetIndex, IDirect3DSurface9* pRenderTarget) { return m_real->SetRenderTarget(RenderTargetIndex, pRenderTarget); }
+HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::SetRenderTarget(DWORD RenderTargetIndex, IDirect3DSurface9* pRenderTarget) {
+    if (RenderTargetIndex == 0) {
+        m_rt0IsPrimary = (pRenderTarget && pRenderTarget == m_cachedBackbuffer);
+        NoteFrameRt0(pRenderTarget);
+    }
+
+    if (m_forcePrimaryRT && RenderTargetIndex == 0 && pRenderTarget && m_cachedBackbuffer) {
+        if (pRenderTarget == m_cachedBackbuffer) {
+            m_rt0IsPrimary = true;
+            return m_real->SetRenderTarget(0, pRenderTarget);
+        }
+
+        if (m_forcePrimaryRTAggressive) {
+            const HRESULT hr = m_real->SetRenderTarget(0, m_cachedBackbuffer);
+            if (SUCCEEDED(hr)) {
+                m_rt0IsPrimary = true;
+                m_dbgRtOverrides++;
+                if ((m_dbgRtOverrides <= 10) || (m_dbgRtOverrides % 300 == 0)) {
+                    OutputDebugStringA("[WALLEFFP] Overrode RT0 -> backbuffer (aggressive)\n");
+                }
+            }
+            return hr;
+        }
+
+        D3DSURFACE_DESC d{};
+        if (SUCCEEDED(pRenderTarget->GetDesc(&d)) && IsLikelyMainSceneRT(d)) {
+            const HRESULT hr = m_real->SetRenderTarget(0, m_cachedBackbuffer);
+            if (SUCCEEDED(hr)) {
+                m_rt0IsPrimary = true;
+                m_dbgRtOverrides++;
+                if ((m_dbgRtOverrides <= 10) || (m_dbgRtOverrides % 300 == 0)) {
+                    char buf[160];
+                    std::snprintf(
+                        buf,
+                        sizeof(buf),
+                        "[WALLEFFP] Overrode RT0 -> backbuffer (%u), rt fmt=%u %ux%u\n",
+                        m_dbgRtOverrides,
+                        static_cast<unsigned>(d.Format),
+                        static_cast<unsigned>(d.Width),
+                        static_cast<unsigned>(d.Height));
+                    OutputDebugStringA(buf);
+                }
+            }
+            return hr;
+        }
+    }
+
+    return m_real->SetRenderTarget(RenderTargetIndex, pRenderTarget);
+}
 HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::GetRenderTarget(DWORD RenderTargetIndex, IDirect3DSurface9** ppRenderTarget) { return m_real->GetRenderTarget(RenderTargetIndex, ppRenderTarget); }
 HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::SetDepthStencilSurface(IDirect3DSurface9* pNewZStencil) { return m_real->SetDepthStencilSurface(pNewZStencil); }
 HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::GetDepthStencilSurface(IDirect3DSurface9** ppZStencilSurface) { return m_real->GetDepthStencilSurface(ppZStencilSurface); }
-HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::BeginScene() { return m_real->BeginScene(); }
-HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::EndScene() { return m_real->EndScene(); }
+HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::BeginScene() {
+    m_inScene = true;
+    m_publishedThisScene = false;
+
+    const HRESULT hr = m_real->BeginScene();
+    if (SUCCEEDED(hr) && m_forcePrimaryRT && m_cachedBackbuffer) {
+        m_real->SetRenderTarget(0, m_cachedBackbuffer);
+        m_rt0IsPrimary = true;
+    }
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::EndScene() {
+    m_inScene = false;
+    return m_real->EndScene();
+}
 HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::Clear(DWORD Count, const D3DRECT* pRects, DWORD Flags, D3DCOLOR Color, float Z, DWORD Stencil) { return m_real->Clear(Count, pRects, Flags, Color, Z, Stencil); }
 HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::SetTransform(D3DTRANSFORMSTATETYPE State, const D3DMATRIX* pMatrix) { return m_real->SetTransform(State, pMatrix); }
 HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::GetTransform(D3DTRANSFORMSTATETYPE State, D3DMATRIX* pMatrix) { return m_real->GetTransform(State, pMatrix); }
@@ -92,7 +495,25 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::LightEnable(DWORD Index, BOOL Enable)
 HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::GetLightEnable(DWORD Index, BOOL* pEnable) { return m_real->GetLightEnable(Index, pEnable); }
 HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::SetClipPlane(DWORD Index, const float* pPlane) { return m_real->SetClipPlane(Index, pPlane); }
 HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::GetClipPlane(DWORD Index, float* pPlane) { return m_real->GetClipPlane(Index, pPlane); }
-HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::SetRenderState(D3DRENDERSTATETYPE State, DWORD Value) { return m_real->SetRenderState(State, Value); }
+HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::SetRenderState(D3DRENDERSTATETYPE State, DWORD Value) {
+    switch (State) {
+        case D3DRS_ZENABLE:
+            m_rsZEnable = Value;
+            break;
+        case D3DRS_ZWRITEENABLE:
+            m_rsZWriteEnable = Value;
+            break;
+        case D3DRS_ALPHABLENDENABLE:
+            m_rsAlphaBlendEnable = Value;
+            break;
+        case D3DRS_COLORWRITEENABLE:
+            m_rsColorWriteEnable = Value;
+            break;
+        default:
+            break;
+    }
+    return m_real->SetRenderState(State, Value);
+}
 HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::GetRenderState(D3DRENDERSTATETYPE State, DWORD* pValue) { return m_real->GetRenderState(State, pValue); }
 HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::CreateStateBlock(D3DSTATEBLOCKTYPE Type, IDirect3DStateBlock9** ppSB) { return m_real->CreateStateBlock(Type, ppSB); }
 HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::BeginStateBlock() { return m_real->BeginStateBlock(); }
@@ -117,55 +538,15 @@ BOOL STDMETHODCALLTYPE D3D9DeviceProxy::GetSoftwareVertexProcessing() { return m
 HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::SetNPatchMode(float nSegments) { return m_real->SetNPatchMode(nSegments); }
 float STDMETHODCALLTYPE D3D9DeviceProxy::GetNPatchMode() { return m_real->GetNPatchMode(); }
 
-void D3D9DeviceProxy::PublishCameraFromVsConsts() {
-    if (!m_real || !m_haveVsConsts) return;
-
-    auto load = [&](UINT base) {
-        D3DMATRIX m{};
-        m._11 = m_vsConsts[base + 0][0];
-        m._12 = m_vsConsts[base + 0][1];
-        m._13 = m_vsConsts[base + 0][2];
-        m._14 = m_vsConsts[base + 0][3];
-        m._21 = m_vsConsts[base + 1][0];
-        m._22 = m_vsConsts[base + 1][1];
-        m._23 = m_vsConsts[base + 1][2];
-        m._24 = m_vsConsts[base + 1][3];
-        m._31 = m_vsConsts[base + 2][0];
-        m._32 = m_vsConsts[base + 2][1];
-        m._33 = m_vsConsts[base + 2][2];
-        m._34 = m_vsConsts[base + 2][3];
-        m._41 = m_vsConsts[base + 3][0];
-        m._42 = m_vsConsts[base + 3][1];
-        m._43 = m_vsConsts[base + 3][2];
-        m._44 = m_vsConsts[base + 3][3];
-        return m;
-    };
-
-    D3DMATRIX view = load(5);
-    D3DMATRIX proj = load(10);
-    D3DMATRIX world = load(14);
-
-    auto sum = [](const D3DMATRIX& m) {
-        const float* f = reinterpret_cast<const float*>(&m);
-        float s = 0.f;
-        for (int i = 0; i < 16; i++) s += std::fabs(f[i]);
-        return s;
-    };
-
-    if (sum(view) < 1e-3f || sum(proj) < 1e-3f) return;
-
-    m_real->SetTransform(D3DTS_VIEW, &view);
-    m_real->SetTransform(D3DTS_PROJECTION, &proj);
-    m_real->SetTransform(D3DTS_WORLD, &world);
-}
-
 HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::DrawPrimitive(D3DPRIMITIVETYPE PrimitiveType, UINT StartVertex, UINT PrimitiveCount) {
-    PublishCameraFromVsConsts();
+    TryPublishCameraOncePerScene();
+    NoteFrameDraw();
     return m_real->DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount);
 }
 
 HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::DrawIndexedPrimitive(D3DPRIMITIVETYPE PrimitiveType, INT BaseVertexIndex, UINT MinVertexIndex, UINT NumVertices, UINT startIndex, UINT primCount) {
-    PublishCameraFromVsConsts();
+    TryPublishCameraOncePerScene();
+    NoteFrameDraw();
     return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, primCount);
 }
 
@@ -184,9 +565,81 @@ HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::SetVertexShaderConstantF(UINT StartRe
     if (pConstantData && StartRegister < 256 && Vector4fCount <= 256 - StartRegister) {
         std::memcpy(&m_vsConsts[StartRegister][0], pConstantData, sizeof(float) * 4 * Vector4fCount);
         m_haveVsConsts = true;
+
+        if (Overlaps(StartRegister, Vector4fCount, 5, 9)) m_dirtyView = true;
+        if (Overlaps(StartRegister, Vector4fCount, 10, 14)) m_dirtyProj = true;
+        if (Overlaps(StartRegister, Vector4fCount, 14, 18)) m_dirtyWorld = true;
     }
 
     return m_real->SetVertexShaderConstantF(StartRegister, pConstantData, Vector4fCount);
+}
+
+HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::SetConvolutionMonoKernel(UINT width, UINT height, float* rows, float* columns) {
+    return m_realEx ? m_realEx->SetConvolutionMonoKernel(width, height, rows, columns) : D3DERR_INVALIDCALL;
+}
+
+HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::ComposeRects(IDirect3DSurface9* pSrc, IDirect3DSurface9* pDst, IDirect3DVertexBuffer9* pSrcRectDescs, UINT NumRects, IDirect3DVertexBuffer9* pDstRectDescs, D3DCOMPOSERECTSOP Operation, INT Xoffset, INT Yoffset) {
+    return m_realEx ? m_realEx->ComposeRects(pSrc, pDst, pSrcRectDescs, NumRects, pDstRectDescs, Operation, Xoffset, Yoffset) : D3DERR_INVALIDCALL;
+}
+
+HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::PresentEx(const RECT* pSourceRect, const RECT* pDestRect, HWND hDestWindowOverride, const RGNDATA* pDirtyRegion, DWORD dwFlags) {
+    return m_realEx ? m_realEx->PresentEx(pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion, dwFlags) : Present(pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion);
+}
+
+HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::GetGPUThreadPriority(INT* pPriority) {
+    return m_realEx ? m_realEx->GetGPUThreadPriority(pPriority) : D3DERR_INVALIDCALL;
+}
+
+HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::SetGPUThreadPriority(INT Priority) {
+    return m_realEx ? m_realEx->SetGPUThreadPriority(Priority) : D3DERR_INVALIDCALL;
+}
+
+HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::WaitForVBlank(UINT iSwapChain) {
+    return m_realEx ? m_realEx->WaitForVBlank(iSwapChain) : D3DERR_INVALIDCALL;
+}
+
+HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::CheckResourceResidency(IDirect3DResource9** pResourceArray, UINT32 NumResources) {
+    return m_realEx ? m_realEx->CheckResourceResidency(pResourceArray, NumResources) : D3DERR_INVALIDCALL;
+}
+
+HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::SetMaximumFrameLatency(UINT MaxLatency) {
+    return m_realEx ? m_realEx->SetMaximumFrameLatency(MaxLatency) : D3DERR_INVALIDCALL;
+}
+
+HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::GetMaximumFrameLatency(UINT* pMaxLatency) {
+    return m_realEx ? m_realEx->GetMaximumFrameLatency(pMaxLatency) : D3DERR_INVALIDCALL;
+}
+
+HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::CheckDeviceState(HWND hDestinationWindow) {
+    return m_realEx ? m_realEx->CheckDeviceState(hDestinationWindow) : D3DERR_INVALIDCALL;
+}
+
+HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::CreateRenderTargetEx(UINT Width, UINT Height, D3DFORMAT Format, D3DMULTISAMPLE_TYPE MultiSample, DWORD MultisampleQuality, BOOL Lockable, IDirect3DSurface9** ppSurface, HANDLE* pSharedHandle, DWORD Usage) {
+    return m_realEx ? m_realEx->CreateRenderTargetEx(Width, Height, Format, MultiSample, MultisampleQuality, Lockable, ppSurface, pSharedHandle, Usage)
+                    : CreateRenderTarget(Width, Height, Format, MultiSample, MultisampleQuality, Lockable, ppSurface, pSharedHandle);
+}
+
+HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::CreateOffscreenPlainSurfaceEx(UINT Width, UINT Height, D3DFORMAT Format, D3DPOOL Pool, IDirect3DSurface9** ppSurface, HANDLE* pSharedHandle, DWORD Usage) {
+    return m_realEx ? m_realEx->CreateOffscreenPlainSurfaceEx(Width, Height, Format, Pool, ppSurface, pSharedHandle, Usage)
+                    : CreateOffscreenPlainSurface(Width, Height, Format, Pool, ppSurface, pSharedHandle);
+}
+
+HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::CreateDepthStencilSurfaceEx(UINT Width, UINT Height, D3DFORMAT Format, D3DMULTISAMPLE_TYPE MultiSample, DWORD MultisampleQuality, BOOL Discard, IDirect3DSurface9** ppSurface, HANDLE* pSharedHandle, DWORD Usage) {
+    return m_realEx ? m_realEx->CreateDepthStencilSurfaceEx(Width, Height, Format, MultiSample, MultisampleQuality, Discard, ppSurface, pSharedHandle, Usage)
+                    : CreateDepthStencilSurface(Width, Height, Format, MultiSample, MultisampleQuality, Discard, ppSurface, pSharedHandle);
+}
+
+HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::ResetEx(D3DPRESENT_PARAMETERS* pPresentationParameters, D3DDISPLAYMODEEX* pFullscreenDisplayMode) {
+    if (!m_realEx) return D3DERR_INVALIDCALL;
+    ReleaseCachedBackbuffer();
+    const HRESULT hr = m_realEx->ResetEx(pPresentationParameters, pFullscreenDisplayMode);
+    if (SUCCEEDED(hr)) UpdateBackbufferDesc();
+    ReinstallActivateAppFilter();
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::GetDisplayModeEx(UINT iSwapChain, D3DDISPLAYMODEEX* pMode, D3DDISPLAYROTATION* pRotation) {
+    return m_realEx ? m_realEx->GetDisplayModeEx(iSwapChain, pMode, pRotation) : D3DERR_INVALIDCALL;
 }
 HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::GetVertexShaderConstantF(UINT StartRegister, float* pConstantData, UINT Vector4fCount) { return m_real->GetVertexShaderConstantF(StartRegister, pConstantData, Vector4fCount); }
 HRESULT STDMETHODCALLTYPE D3D9DeviceProxy::SetVertexShaderConstantI(UINT StartRegister, const int* pConstantData, UINT Vector4iCount) { return m_real->SetVertexShaderConstantI(StartRegister, pConstantData, Vector4iCount); }

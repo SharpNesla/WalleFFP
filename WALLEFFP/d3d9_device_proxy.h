@@ -8,7 +8,7 @@
 
 // Simple forwarding proxy for IDirect3DDevice9.
 // All calls are forwarded 1:1 to the underlying Remix device.
-class D3D9DeviceProxy final : public IDirect3DDevice9 {
+class D3D9DeviceProxy final : public IDirect3DDevice9Ex {
 public:
     explicit D3D9DeviceProxy(IDirect3DDevice9* real);
     ~D3D9DeviceProxy();
@@ -136,12 +136,84 @@ public:
     HRESULT STDMETHODCALLTYPE DeletePatch(UINT Handle) override;
     HRESULT STDMETHODCALLTYPE CreateQuery(D3DQUERYTYPE Type, IDirect3DQuery9** ppQuery) override;
 
+    // IDirect3DDevice9Ex
+    HRESULT STDMETHODCALLTYPE SetConvolutionMonoKernel(UINT width, UINT height, float* rows, float* columns) override;
+    HRESULT STDMETHODCALLTYPE ComposeRects(IDirect3DSurface9* pSrc, IDirect3DSurface9* pDst, IDirect3DVertexBuffer9* pSrcRectDescs, UINT NumRects, IDirect3DVertexBuffer9* pDstRectDescs, D3DCOMPOSERECTSOP Operation, INT Xoffset, INT Yoffset) override;
+    HRESULT STDMETHODCALLTYPE PresentEx(const RECT* pSourceRect, const RECT* pDestRect, HWND hDestWindowOverride, const RGNDATA* pDirtyRegion, DWORD dwFlags) override;
+    HRESULT STDMETHODCALLTYPE GetGPUThreadPriority(INT* pPriority) override;
+    HRESULT STDMETHODCALLTYPE SetGPUThreadPriority(INT Priority) override;
+    HRESULT STDMETHODCALLTYPE WaitForVBlank(UINT iSwapChain) override;
+    HRESULT STDMETHODCALLTYPE CheckResourceResidency(IDirect3DResource9** pResourceArray, UINT32 NumResources) override;
+    HRESULT STDMETHODCALLTYPE SetMaximumFrameLatency(UINT MaxLatency) override;
+    HRESULT STDMETHODCALLTYPE GetMaximumFrameLatency(UINT* pMaxLatency) override;
+    HRESULT STDMETHODCALLTYPE CheckDeviceState(HWND hDestinationWindow) override;
+    HRESULT STDMETHODCALLTYPE CreateRenderTargetEx(UINT Width, UINT Height, D3DFORMAT Format, D3DMULTISAMPLE_TYPE MultiSample, DWORD MultisampleQuality, BOOL Lockable, IDirect3DSurface9** ppSurface, HANDLE* pSharedHandle, DWORD Usage) override;
+    HRESULT STDMETHODCALLTYPE CreateOffscreenPlainSurfaceEx(UINT Width, UINT Height, D3DFORMAT Format, D3DPOOL Pool, IDirect3DSurface9** ppSurface, HANDLE* pSharedHandle, DWORD Usage) override;
+    HRESULT STDMETHODCALLTYPE CreateDepthStencilSurfaceEx(UINT Width, UINT Height, D3DFORMAT Format, D3DMULTISAMPLE_TYPE MultiSample, DWORD MultisampleQuality, BOOL Discard, IDirect3DSurface9** ppSurface, HANDLE* pSharedHandle, DWORD Usage) override;
+    HRESULT STDMETHODCALLTYPE ResetEx(D3DPRESENT_PARAMETERS* pPresentationParameters, D3DDISPLAYMODEEX* pFullscreenDisplayMode) override;
+    HRESULT STDMETHODCALLTYPE GetDisplayModeEx(UINT iSwapChain, D3DDISPLAYMODEEX* pMode, D3DDISPLAYROTATION* pRotation) override;
+
 private:
-    void PublishCameraFromVsConsts();
+    static bool Overlaps(UINT start, UINT count, UINT a, UINT b);
+
+    bool PublishCameraFromVsConstsIfValid();
+    void TryPublishCameraOncePerScene();
+
+    void ReinstallActivateAppFilter();
+    void ReleaseCachedBackbuffer();
+    void NoteFrameRt0(IDirect3DSurface9* rt);
+    void NoteFrameDraw();
+    void EndFrameStats();
+    void UpdateBackbufferDesc();
+    bool IsLikelyMainSceneRT(const D3DSURFACE_DESC& d) const;
 
     std::atomic<ULONG> m_refCount{1};
     IDirect3DDevice9* m_real = nullptr;
+    IDirect3DDevice9Ex* m_realEx = nullptr;
 
     float m_vsConsts[256][4] = {};
     bool m_haveVsConsts = false;
+
+    bool m_inScene = false;
+    bool m_publishedThisScene = false;
+    bool m_dirtyView = false;
+    bool m_dirtyProj = false;
+    bool m_dirtyWorld = false;
+
+    bool m_rt0IsPrimary = true;
+    bool m_forcePrimaryRTAggressive = false;
+
+    DWORD m_rsZEnable = D3DZB_TRUE;
+    DWORD m_rsZWriteEnable = TRUE;
+    DWORD m_rsAlphaBlendEnable = FALSE;
+    DWORD m_rsColorWriteEnable = 0x0000000F; // D3DCOLORWRITEENABLE_* mask
+
+    D3DMATRIX m_lastView{};
+    D3DMATRIX m_lastProj{};
+    D3DMATRIX m_lastWorld{};
+    bool m_haveLastCamera = false;
+
+    // Off by default: the game draws its geometry straight into the backbuffer;
+    // redirecting its offscreen (post-process) targets only breaks the image.
+    // Opt in with WALLEFFP_FORCE_PRIMARY_RT[_AGGRESSIVE]=1.
+    bool m_forcePrimaryRT = false;
+    UINT m_bbWidth = 0;
+    UINT m_bbHeight = 0;
+    D3DFORMAT m_bbFormat = D3DFMT_UNKNOWN;
+    IDirect3DSurface9* m_cachedBackbuffer = nullptr;
+
+    uint32_t m_dbgCameraPublishes = 0;
+    uint32_t m_dbgRtOverrides = 0;
+
+    struct FrameRt {
+        IDirect3DSurface9* surface;
+        UINT draws;
+        UINT cameraDraws;
+    };
+    static constexpr UINT kMaxFrameRts = 16;
+    static constexpr UINT kFrameStatsPeriod = 300;
+    FrameRt m_frameRts[kMaxFrameRts] = {};
+    UINT m_frameRtCount = 0;
+    int m_frameRtCur = -1;
+    UINT m_frameNo = 0;
 };

@@ -47,17 +47,23 @@
     <TargetName>d3d9</TargetName>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
-    <ConfigurationType>Application</ConfigurationType>
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
     <PlatformToolset>v145</PlatformToolset>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <TargetName>d3d9</TargetName>
+  </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
-    <ConfigurationType>Application</ConfigurationType>
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
     <PlatformToolset>v145</PlatformToolset>
     <WholeProgramOptimization>true</WholeProgramOptimization>
     <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <TargetName>d3d9</TargetName>
   </PropertyGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
@@ -79,6 +85,16 @@
     </ImportGroup>
 
   <PropertyGroup Label="UserMacros" />
+  <PropertyGroup Label="WALLEFFPDeploy">
+    <WALLEFFPGameDir>$(WALLEFFP_GAME_DIR)</WALLEFFPGameDir>
+    <WALLEFFPGameExe>$(WALLEFFP_GAME_EXE)</WALLEFFPGameExe>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <PostBuildEvent>
+      <Command>if not "$(WALLEFFPGameDir)"=="" (if not exist "$(WALLEFFPGameDir)" (echo WALLEFFP_GAME_DIR does not exist: "$(WALLEFFPGameDir)" &amp; exit /b 1) &amp; copy /Y "$(TargetPath)" "$(WALLEFFPGameDir)\d3d9.dll" &gt;nul &amp; if exist "$(TargetDir)$(TargetName).pdb" copy /Y "$(TargetDir)$(TargetName).pdb" "$(WALLEFFPGameDir)\d3d9.pdb" &gt;nul)</Command>
+    </PostBuildEvent>
+  </ItemDefinitionGroup>
 
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
@@ -141,9 +157,11 @@
     <ClCompile Include="dllmain.cpp" />
     <ClCompile Include="d3d9_proxy.cpp" />
     <ClCompile Include="d3d9_device_proxy.cpp" />
+    <ClCompile Include="window_hook.cpp" />
 
     <ClInclude Include="d3d9_proxy.h" />
     <ClInclude Include="d3d9_device_proxy.h" />
+    <ClInclude Include="window_hook.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

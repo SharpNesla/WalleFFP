@@ -10,6 +10,13 @@ extern "C" void ProxyAddRemixRef();
 extern "C" void ProxyReleaseRemixRef();
 extern "C" bool ProxyIsUsingRemix();
 
+// Reads a 0/1 switch from the environment; returns def when the variable is unset.
+inline bool ProxyEnvFlag(const char* name, bool def) {
+    char buf[8] = {};
+    if (GetEnvironmentVariableA(name, buf, static_cast<DWORD>(sizeof(buf))) == 0) return def;
+    return buf[0] != '0';
+}
+
 class D3D9Proxy final : public IDirect3D9Ex {
 public:
     explicit D3D9Proxy(IDirect3D9* real);

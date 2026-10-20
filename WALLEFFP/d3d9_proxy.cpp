@@ -1,5 +1,6 @@
 #include "d3d9_proxy.h"
 #include "d3d9_device_proxy.h"
+#include "window_hook.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -94,6 +95,8 @@ HRESULT STDMETHODCALLTYPE D3D9Proxy::CheckDeviceFormatConversion(UINT Adapter, D
 HRESULT STDMETHODCALLTYPE D3D9Proxy::GetDeviceCaps(UINT Adapter, D3DDEVTYPE DeviceType, D3DCAPS9* pCaps) {
     HRESULT hr = m_real->GetDeviceCaps(Adapter, DeviceType, pCaps);
     if (FAILED(hr) || !pCaps) return hr;
+    static const bool spoofCaps = ProxyEnvFlag("WALLEFFP_SPOOF_CAPS", true);
+    if (!spoofCaps) return hr;
 
     // Many DX9-era games choose different rendering paths based on shader model
     // and reported capabilities. By advertising PS 1.4 / VS 1.1 and weak caps,
@@ -146,6 +149,8 @@ HRESULT STDMETHODCALLTYPE D3D9Proxy::CreateDevice(UINT Adapter, D3DDEVTYPE Devic
     HRESULT hr = m_real->CreateDevice(Adapter, DeviceType, hFocusWindow, BehaviorFlags, pPresentationParameters, &realDevice);
     if (FAILED(hr) || !realDevice) return hr;
 
+    InstallActivateAppFilter(hFocusWindow ? hFocusWindow : (pPresentationParameters ? pPresentationParameters->hDeviceWindow : nullptr));
+
     auto* proxyDevice = new D3D9DeviceProxy(realDevice);
     {
         char buff[128] = {};
@@ -176,10 +181,22 @@ HRESULT STDMETHODCALLTYPE D3D9Proxy::CreateDeviceEx(UINT Adapter, D3DDEVTYPE Dev
     *ppReturnedDeviceInterface = nullptr;
     if (!m_realEx) return D3DERR_INVALIDCALL;
 
-    // IDirect3DDevice9Ex includes extra methods. To avoid unsafe vtable casts,
-    // we return the real Ex device unwrapped. CreateDevice (non-Ex) is wrapped.
-    return m_realEx->CreateDeviceEx(Adapter, DeviceType, hFocusWindow, BehaviorFlags,
-                                    pPresentationParameters, pFullscreenDisplayMode, ppReturnedDeviceInterface);
+    IDirect3DDevice9Ex* realDeviceEx = nullptr;
+    HRESULT hr = m_realEx->CreateDeviceEx(Adapter, DeviceType, hFocusWindow, BehaviorFlags,
+                                          pPresentationParameters, pFullscreenDisplayMode, &realDeviceEx);
+    if (FAILED(hr) || !realDeviceEx) return hr;
+
+    InstallActivateAppFilter(hFocusWindow ? hFocusWindow : (pPresentationParameters ? pPresentationParameters->hDeviceWindow : nullptr));
+
+    auto* proxyDevice = new D3D9DeviceProxy(realDeviceEx);
+    {
+        char buff[128] = {};
+        sprintf_s(buff, sizeof(buff), "D3D9Proxy::CreateDeviceEx Adapter=%u DeviceType=%08x BehaviorFlags=%08x -> returning proxy device", Adapter, static_cast<unsigned int>(DeviceType), BehaviorFlags);
+        OutputDebugStringA(buff);
+    }
+    realDeviceEx->Release();
+    *ppReturnedDeviceInterface = static_cast<IDirect3DDevice9Ex*>(proxyDevice);
+    return hr;
 }
 
 HRESULT STDMETHODCALLTYPE D3D9Proxy::GetAdapterLUID(UINT Adapter, LUID* pLUID) {
