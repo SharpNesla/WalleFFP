@@ -1,0 +1,15 @@
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.ipch
+*.VC.db
+
+# Build output
+Debug/
+Release/
+x64/
+WALLEFFP/WALLEFFP/
+
+# Local archives
+*.zip
